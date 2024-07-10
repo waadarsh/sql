@@ -10,11 +10,6 @@ import logging
 
 embedding_function = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
 
-# replace
-ZILLIZ_CLOUD_URI = "https://in03-d274f3928840065.api.gcp-us-west1.zillizcloud.com"
-ZILLIZ_CLOUD_USERNAME = 'db_d274f3928840065'
-ZILLIZ_CLOUD_PASSWORD = 'Fu8[^*[rAXb0DX&v'
-
 # Define a custom log format with colors
 log_format = ("%(log_color)s%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 

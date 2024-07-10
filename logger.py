@@ -1,17 +1,24 @@
 import os
-import logging
-import colorlog
-from langchain_community.embeddings.sentence_transformer import SentenceTransformerEmbeddings
-from langchain_huggingface.embeddings import HuggingFaceEmbeddings
-from langchain_milvus.retrievers import MilvusCollectionHybridSearchRetriever
-from pymilvus import (
-    Collection,
-    connections,
-    WeightedRanker,
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.vectorstores import Milvus
+from langchain_community.embeddings.sentence_transformer import (
+    SentenceTransformerEmbeddings,
 )
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+import colorlog
+import logging
 
-# Logging configuration
+embedding_function = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
+
+# replace
+ZILLIZ_CLOUD_URI = "https://in03-d274f3928840065.api.gcp-us-west1.zillizcloud.com"
+ZILLIZ_CLOUD_USERNAME = 'db_d274f3928840065'
+ZILLIZ_CLOUD_PASSWORD = 'Fu8[^*[rAXb0DX&v'
+
+# Define a custom log format with colors
 log_format = ("%(log_color)s%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+
+# Create a colored formatter
 formatter = colorlog.ColoredFormatter(
     log_format,
     datefmt="%Y-%m-%d %H:%M:%S",
@@ -23,50 +30,58 @@ formatter = colorlog.ColoredFormatter(
         'CRITICAL': 'bold_red',
     }
 )
+
+# Configure the logger
 handler = logging.StreamHandler()
 handler.setFormatter(formatter)
+
 logger = logging.getLogger(__name__)
 logger.addHandler(handler)
 logger.setLevel(logging.DEBUG)
 
-CONNECTION_URI = "http://localhost:19530"
+text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
 
-# Connect to Milvus
-connections.connect(uri=CONNECTION_URI)
+# logger.debug("Attempting to retrieve web document")
+# loader = WebBaseLoader(
+#     web_paths=("https://lilianweng.github.io/posts/2023-06-23-agent/",),
+#     bs_kwargs=dict(
+#         parse_only=bs4.SoupStrainer(
+#             class_=("post-content", "post-title", "post-header")
+#         )
+#     ),
+# )
+# docs = loader.load()
+# logger.info("Document loaded successfully")
+# splits = text_splitter.split_documents(docs)
+# logger.info("Documents split into chunks")
 
-# Embedding functions
-model_name = "sentence-transformers/all-mpnet-base-v2"
-model_kwargs = {'device': 'cpu'}
-encode_kwargs = {'normalize_embeddings': False}
-dense_embedding_func = HuggingFaceEmbeddings(
-    model_name=model_name,
-    model_kwargs=model_kwargs,
-    encode_kwargs=encode_kwargs
+logger.debug("Attempting to load pdf document")
+loader = PyPDFLoader("2023-nissan-ariya-en.pdf", extract_images=True)
+pages = loader.load()
+logger.info("Pdf loaded Successfully")
+splits_1 = text_splitter.split_documents(pages)
+logger.info("pdf split into chunks")
+
+# logger.debug("Attempting to vectorize document")
+# vectorstore = Chroma.from_documents(documents=splits, embedding=embeddings, persist_directory="./chroma_db")
+# logger.info("document stored in chroma db")
+
+logger.debug("Attempting to vectorize pdf")
+# vectorstore = Milvus.from_documents(
+#     splits_1,
+#     embedding_function,
+#     connection_args={"uri": "http://localhost:19530"},
+# )
+
+vectorstore = Milvus.from_documents(
+    splits_1,
+    embedding_function,
+    connection_args={
+        "uri": ZILLIZ_CLOUD_URI,
+        "user": ZILLIZ_CLOUD_USERNAME,
+        "password": ZILLIZ_CLOUD_PASSWORD,
+        "secure": True,
+    },
 )
 
-# Retrieve documents from collection
-collection_name = "Nissan_Ariya"
-collection = Collection(collection_name)
-dense_field = "dense_vector"
-sparse_field = "sparse_vector"
-text_field = "text"
-
-sparse_search_params = {"metric_type": "IP"}
-dense_search_params = {"metric_type": "IP", "params": {}}
-retriever = MilvusCollectionHybridSearchRetriever(
-    collection=collection,
-    rerank=WeightedRanker(0.5, 0.5),
-    anns_fields=[dense_field, sparse_field],
-    field_embeddings=[dense_embedding_func, dense_embedding_func],
-    field_search_params=[dense_search_params, sparse_search_params],
-    top_k=3,
-    text_field=text_field,
-)
-
-# Example query
-query = "What are the story about ventures?"
-logger.debug("Invoking hybrid search")
-results = retriever.invoke(query)
-logger.info("Retriever invoked successfully")
-for result in results:
-    print(result)
+logger.info("pdf stored in milvus db")

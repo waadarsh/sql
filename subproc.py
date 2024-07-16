@@ -1,4 +1,3 @@
-# main.py
 import asyncio
 from fastapi import FastAPI, HTTPException
 
@@ -9,14 +8,20 @@ class SubprocessManager:
 
     async def run_script(self, command):
         self.status = "Running"
-        self.process = await asyncio.create_subprocess_shell(
-            command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await self.process.communicate()
-        self.status = "Completed" if self.process.returncode == 0 else "Failed"
-        return stdout.decode(), stderr.decode()
+        try:
+            self.process = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await self.process.communicate()
+            self.status = "Completed" if self.process.returncode == 0 else "Failed"
+            return stdout.decode(), stderr.decode()
+        except Exception as e:
+            self.status = "Failed"
+            raise e
+        finally:
+            self.process = None
 
     def get_status(self):
         return self.status
@@ -43,8 +48,10 @@ autotrain dreambooth \
 async def run_subprocess():
     if subprocess_manager.get_status() == "Running":
         raise HTTPException(status_code=400, detail="A subprocess is already running.")
-    stdout, stderr = await subprocess_manager.run_script(command)
-    return {"stdout": stdout, "stderr": stderr}
+    
+    # Start the subprocess asynchronously and respond immediately
+    asyncio.create_task(subprocess_manager.run_script(command))
+    return {"detail": "Subprocess started"}
 
 @app.get("/subprocess-status")
 def subprocess_status():

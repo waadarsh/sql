@@ -1,13 +1,16 @@
 import asyncio
 from fastapi import FastAPI, HTTPException
+from datetime import datetime, timedelta
 
 class SubprocessManager:
     def __init__(self):
         self.process = None
         self.status = "Not Started"
+        self.start_time = None
 
     async def run_script(self, command):
         self.status = "Running"
+        self.start_time = datetime.now()
         try:
             self.process = await asyncio.create_subprocess_shell(
                 command,
@@ -22,37 +25,32 @@ class SubprocessManager:
             raise e
         finally:
             self.process = None
+            self.start_time = None
 
     def get_status(self):
-        return self.status
+        elapsed_time = None
+        if self.start_time:
+            elapsed_time = datetime.now() - self.start_time
+        return {"status": self.status, "elapsed_time": str(elapsed_time) if elapsed_time else None}
 
 app = FastAPI()
 subprocess_manager = SubprocessManager()
 
-command = """
-autotrain dreambooth \
---model='stabilityai/stable-diffusion-xl-base-1.0' \
---project-name='lora' \
---image-path='/content/images' \
---prompt='a photo of nissan_concept' \
---resolution=1024 \
---batch-size=1 \
---num-steps=500 \
---gradient-accumulation=4 \
---lr=1e-4 \
---mixed-precision fp16 \
---xformers
-"""
+command = "python subscript.py"
 
-@app.get("/run-subprocess")
+@app.get("/run")
 async def run_subprocess():
-    if subprocess_manager.get_status() == "Running":
+    if subprocess_manager.get_status()["status"] == "Running":
         raise HTTPException(status_code=400, detail="A subprocess is already running.")
     
     # Start the subprocess asynchronously and respond immediately
     asyncio.create_task(subprocess_manager.run_script(command))
     return {"detail": "Subprocess started"}
 
-@app.get("/subprocess-status")
+@app.get("/check")
 def subprocess_status():
-    return {"status": subprocess_manager.get_status()}
+    return subprocess_manager.get_status()
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("test-endpoint:app",host="127.0.0.1",port=8000,reload=False)

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, WebSocket, BackgroundTasks
+from fastapi import FastAPI, WebSocket
 from fastapi.responses import HTMLResponse
 import asyncio
 from diffusers import StableDiffusionPipeline
@@ -28,13 +28,13 @@ async def websocket_endpoint(websocket: WebSocket):
     prompt = "A beautiful landscape painting"
     
     # Function to generate images with progress callback
-    def progress_callback(step, t, latents):
+    async def progress_callback(step, t, latents):
         global progress
         progress = int((step / pipe.scheduler.config.num_train_timesteps) * 100)
-        asyncio.run(websocket.send_json({"progress": progress}))
+        await websocket.send_json({"progress": progress})
     
     # Generate image
-    with torch.no_grad():
+    async with torch.no_grad():
         image = pipe(prompt, callback=progress_callback).images[0]
     
     await websocket.close()

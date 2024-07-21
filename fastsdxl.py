@@ -6,6 +6,7 @@ from diffusers import StableDiffusionPipeline
 import torch
 import asyncio
 from datetime import datetime
+import json
 
 app = FastAPI()
 progress = 0
@@ -28,12 +29,21 @@ html = """
     </head>
     <body>
         <h1>Stable Diffusion Progress</h1>
-        <p id="progress">Waiting for progress...</p>
+        <input type="text" id="prompt-input" placeholder="Enter your prompt here">
+        <button onclick="generateImage()">Generate Image</button>
+        <p id="progress">Waiting for prompt...</p>
         <img id="generated-image" style="display:none;" />
         <p id="save-path"></p>
         <script>
             var ws = new WebSocket("ws://localhost:8000/ws");
             ws.binaryType = "arraybuffer";
+            
+            function generateImage() {
+                var prompt = document.getElementById('prompt-input').value;
+                ws.send(JSON.stringify({type: "prompt", prompt: prompt}));
+                document.getElementById('progress').innerText = 'Generation started...';
+            }
+            
             ws.onmessage = function(event) {
                 if (typeof event.data === "string") {
                     var data = JSON.parse(event.data);
@@ -93,12 +103,17 @@ async def generate_image(prompt, websocket: WebSocket):
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    prompt = "A beautiful landscape painting"
+    
     try:
-        await generate_image(prompt, websocket)
+        while True:
+            data = await websocket.receive_text()
+            message = json.loads(data)
+            if message["type"] == "prompt":
+                prompt = message["prompt"]
+                await generate_image(prompt, websocket)
     finally:
         await websocket.close()
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("sdxl-test-1:app", host="127.0.0.1", port=8000, reload=False)
+    uvicorn.run("sdxl-text-1:app", host="127.0.0.1", port=8000, reload=False)

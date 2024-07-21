@@ -1,18 +1,17 @@
-import React, { useState, useEffect, useRef } from 'react';
-
-const StableDiffusionProgress = () => {
+function StableDiffusion() {
   const [prompt, setPrompt] = useState('');
   const [progress, setProgress] = useState('Waiting for prompt...');
   const [imageSrc, setImageSrc] = useState('');
   const [savePath, setSavePath] = useState('');
-  const ws = useRef(null);
+  const [ws, setWs] = useState(null);
 
   useEffect(() => {
-    ws.current = new WebSocket('ws://localhost:8000/ws');
-    ws.current.binaryType = 'arraybuffer';
+    const websocket = new WebSocket("ws://localhost:8000/ws");
+    websocket.binaryType = "arraybuffer";
+    setWs(websocket);
 
-    ws.current.onmessage = (event) => {
-      if (typeof event.data === 'string') {
+    websocket.onmessage = (event) => {
+      if (typeof event.data === "string") {
         const data = JSON.parse(event.data);
         if (data.progress !== undefined) {
           setProgress(`Progress: ${data.progress}%`);
@@ -21,37 +20,39 @@ const StableDiffusionProgress = () => {
         }
       } else {
         setProgress('Image generated!');
-        const blob = new Blob([event.data], { type: 'image/png' });
+        const blob = new Blob([event.data], {type: "image/png"});
         const url = URL.createObjectURL(blob);
         setImageSrc(url);
       }
     };
 
     return () => {
-      ws.current.close();
+      websocket.close();
     };
   }, []);
 
   const generateImage = () => {
-    ws.current.send(JSON.stringify({ type: 'prompt', prompt }));
-    setProgress('Generation started...');
+    if (ws) {
+      ws.send(JSON.stringify({type: "prompt", prompt: prompt}));
+      setProgress('Generation started...');
+    }
   };
 
   return (
-    <div>
+    <Container>
       <h1>Stable Diffusion Progress</h1>
-      <input
-        type="text"
-        value={prompt}
-        onChange={(e) => setPrompt(e.target.value)}
+      <Input 
+        type="text" 
+        value={prompt} 
+        onChange={(e) => setPrompt(e.target.value)} 
         placeholder="Enter your prompt here"
       />
-      <button onClick={generateImage}>Generate Image</button>
+      <Button color="primary" onClick={generateImage}>Generate Image</Button>
       <p>{progress}</p>
-      {imageSrc && <img src={imageSrc} alt="Generated" style={{ display: 'block' }} />}
+      {imageSrc && <img src={imageSrc} alt="Generated" style={{display: 'block', maxWidth: '100%'}} />}
       <p>{savePath}</p>
-    </div>
+    </Container>
   );
-};
+}
 
-export default StableDiffusionProgress;
+export default StableDiffusion;

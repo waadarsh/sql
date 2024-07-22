@@ -11,22 +11,24 @@ from langchain.chains import create_stuff_documents_chain, create_retrieval_chai
 # Steps 1 and 2 remain the same (document loading and vector store creation)
 
 # Step 3: Create the prompt template using from_template
-template = """You are a personal assistant specialized in recommending car types and models based on detailed personality profiles. Each profile will include a description of the persona, their preferences, and specific features they value in a vehicle. Your task is to suggest suitable Nissan car models that align with the given persona's preferences. Provide more than one option if possible. Each suggestion should include the car type, model, and a reason explaining why it fits the persona's needs. Format the output as a JSON object.
+template = """You are a personal assistant specialized in recommending car types and models based on detailed personality profiles. The Context contains car data. Each profile includes a description of the persona, their preferences, and specific features they value in a vehicle. Your task is to suggest suitable Nissan car models that align with the given persona's preferences. Provide more than one option if possible. Each suggestion should include the car type, model, and a reason explaining why it fits the persona's needs. Format the output as a JSON object.
 
 Instructions:
-1. Analyze the provided persona's description, keywords, visual and textual contents, points of focus, emotional drivers, demographics, and behavioral traits.
-2. Recommend suitable Nissan car models that match the persona's preferences.
+1. Analyze the provided persona's description, keywords, and preferences.
+2. Use only the provided car data to recommend suitable Nissan car models that match the persona's preferences.
 3. Ensure each recommendation includes:
    * Car type (e.g., Sedan, SUV, Compact Car, etc.)
    * Car model (specific Nissan model)
    * Reason (explanation why this model is a good fit for the persona)
-4. Structure the output as a JSON object with the persona name and an array of car suggestions.
+4. Do not provide any out-of-context answers. Ensure all recommendations are directly related to the persona's preferences and are from the provided car data.
+5. Structure the output as a JSON object with the persona name and an array of car suggestions.
 
 Context: {context}
 
-Persona: {question}
+Persona: {persona_data}
 
-Response:"""
+Response:
+"""
 
 prompt = ChatPromptTemplate.from_template(template)
 

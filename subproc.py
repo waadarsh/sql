@@ -6,11 +6,9 @@ class SubprocessManager:
     def __init__(self):
         self.process = None
         self.status = "Not Started"
-        self.start_time = None
 
     async def run_script(self, command):
         self.status = "Running"
-        self.start_time = datetime.now()
         try:
             self.process = await asyncio.create_subprocess_shell(
                 command,
@@ -25,31 +23,27 @@ class SubprocessManager:
             raise e
         finally:
             self.process = None
-            self.start_time = None
 
     def get_status(self):
-        elapsed_time = None
-        if self.start_time:
-            elapsed_time = datetime.now() - self.start_time
-        return {"status": self.status, "elapsed_time": str(elapsed_time) if elapsed_time else None}
+        return self.status
 
 app = FastAPI()
 subprocess_manager = SubprocessManager()
 
-command = "python subscript.py"
+command = "accelerate launch train_dreambooth_lora_sdxl.py"
 
 @app.get("/run")
 async def run_subprocess():
-    if subprocess_manager.get_status()["status"] == "Running":
+    if subprocess_manager.get_status() == "Running":
         raise HTTPException(status_code=400, detail="A subprocess is already running.")
     
     # Start the subprocess asynchronously and respond immediately
     asyncio.create_task(subprocess_manager.run_script(command))
     return {"detail": "Subprocess started"}
 
-@app.get("/check")
+@app.get("/status")
 def subprocess_status():
-    return subprocess_manager.get_status()
+    return {"detail" : subprocess_manager.get_status()}
 
 if __name__ == "__main__":
     import uvicorn

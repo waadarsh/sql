@@ -1,3 +1,5 @@
+import json
+import re
 from langchain.chat_models import ChatOpenAI
 from langchain.embeddings import OpenAIEmbeddings
 from langchain.vectorstores import FAISS
@@ -5,12 +7,11 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.document_loaders import TextLoader
 from langchain.prompts import ChatPromptTemplate
 from langchain.chains import create_stuff_documents_chain, create_retrieval_chain
-from langchain.schema import SystemMessage, HumanMessagePromptTemplate
 
 # Steps 1 and 2 remain the same (document loading and vector store creation)
 
-# Step 3: Create the prompt template using from_messages
-system_message = """You are a personal assistant specialized in recommending car types and models based on detailed personality profiles. Each profile will include a description of the persona, their preferences, and specific features they value in a vehicle. Your task is to suggest suitable Nissan car models that align with the given persona's preferences. Provide more than one option if possible. Each suggestion should include the car type, model, and a reason explaining why it fits the persona's needs. Format the output as a JSON object.
+# Step 3: Create the prompt template using from_template
+template = """You are a personal assistant specialized in recommending car types and models based on detailed personality profiles. Each profile will include a description of the persona, their preferences, and specific features they value in a vehicle. Your task is to suggest suitable Nissan car models that align with the given persona's preferences. Provide more than one option if possible. Each suggestion should include the car type, model, and a reason explaining why it fits the persona's needs. Format the output as a JSON object.
 
 Instructions:
 1. Analyze the provided persona's description, keywords, visual and textual contents, points of focus, emotional drivers, demographics, and behavioral traits.
@@ -19,15 +20,18 @@ Instructions:
    * Car type (e.g., Sedan, SUV, Compact Car, etc.)
    * Car model (specific Nissan model)
    * Reason (explanation why this model is a good fit for the persona)
-4. Structure the output as a JSON object with the persona name and an array of car suggestions."""
+4. Structure the output as a JSON object with the persona name and an array of car suggestions.
 
-prompt = ChatPromptTemplate.from_messages([
-    SystemMessage(content=system_message),
-    HumanMessagePromptTemplate.from_template("Context: {context}\n\nPersona: {question}")
-])
+Context: {context}
 
-# Step 4: Create the LLM
-llm = ChatOpenAI()
+Persona: {question}
+
+Response:"""
+
+prompt = ChatPromptTemplate.from_template(template)
+
+# Step 4: Create the LLM with JSON output format
+llm = ChatOpenAI().bind(response_format={"type": "json_object"})
 
 # Step 5: Create the document chain
 document_chain = create_stuff_documents_chain(llm, prompt)
@@ -39,7 +43,20 @@ retrieval_chain = create_retrieval_chain(retriever, document_chain)
 # Step 7: Function to process persona and get car suggestions
 def get_car_suggestions(persona_data):
     response = retrieval_chain.invoke({"question": str(persona_data)})
-    return response["answer"]
+    answer = response["answer"]
+    
+    # Extract JSON content from the response
+    json_match = re.search(r"```json\n(.*?)```", answer, re.DOTALL)
+    if json_match:
+        json_str = json_match.group(1)
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError:
+            print("Error: Unable to parse JSON")
+            return None
+    else:
+        print("Error: No JSON found in the response")
+        return None
 
 # Example usage
 persona_data = {
@@ -62,4 +79,7 @@ persona_data = {
 }
 
 suggestions = get_car_suggestions(persona_data)
-print(suggestions)
+if suggestions:
+    print(json.dumps(suggestions, indent=2))
+else:
+    print("Failed to get suggestions")

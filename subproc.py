@@ -9,7 +9,6 @@ class TrainingProgress:
         self.status = "Not Started"
 
 progress = TrainingProgress()
-
 app = FastAPI()
 
 async def run_training_script():

@@ -321,3 +321,159 @@ async def websocket_endpoint(websocket: WebSocket):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+import logging
+import os
+import sys
+import json
+import colorlog
+import chromadb
+from openai import AsyncAzureOpenAI
+from dotenv import load_dotenv
+from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
+from chromadb.config import Settings
+from typing import Dict, Any, Optional, List
+import asyncio
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel
+import uuid
+from datetime import datetime, timezone
+from pony.orm import Database, Required, Optional as PonyOptional, Json, Set, db_session, commit
+from pony.orm.asynchronous import set_sql_debug
+from contextlib import asynccontextmanager
+
+# Load environment variables
+load_dotenv('.env')
+
+# Database setup
+db = Database()
+
+class ChatSession(db.Entity):
+    id = Required(uuid.UUID, default=uuid.uuid4, primary_key=True)
+    created_at = Required(datetime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Required(datetime, default=lambda: datetime.now(timezone.utc))
+    chat_history = Required(Json)
+
+# Connect to the database
+db.bind(provider='postgres', host=os.getenv('DB_HOST'), user=os.getenv('DB_USER'), 
+        password=os.getenv('DB_PASSWORD'), database=os.getenv('DB_NAME'))
+db.generate_mapping(create_tables=True)
+
+set_sql_debug(True)  # Enable SQL debug logging
+
+class RAGChatbot:
+    def __init__(self, client: AsyncAzureOpenAI, openai_ef: OpenAIEmbeddingFunction, chroma_client: chromadb.PersistentClient):
+        # Suppress HTTP request logs
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+
+        # Set up logger
+        self.logger = self.setup_logger()
+
+        # Initialize clients
+        self.client = client
+        self.openai_ef = openai_ef
+        self.chroma_client = chroma_client
+
+        # Load the collections
+        self.excel_collection = self.chroma_client.get_collection(name="test", embedding_function=self.openai_ef)
+        self.pdf_collection = self.chroma_client.get_collection(name="pdf", embedding_function=self.openai_ef)
+
+    def setup_logger(self):
+        # ... (logger setup code remains unchanged)
+
+    async def retrieve_excel_data(self, query: str, top_k: int = 5) -> Optional[Dict[str, Any]]:
+        # ... (method remains unchanged)
+
+    async def retrieve_pdf_data(self, query: str, top_k: int = 5) -> Optional[list]:
+        # ... (method remains unchanged)
+
+    async def concurrent_retrieval(self, query: str, top_k: int = 5) -> tuple:
+        # ... (method remains unchanged)
+
+    def format_excel_data(self, excel_results: Optional[Dict[str, Any]]) -> str:
+        # ... (method remains unchanged)
+
+    def format_pdf_data(self, pdf_results: Optional[list]) -> str:
+        # ... (method remains unchanged)
+
+    def format_chat_history(self, chat_history: List[Dict[str, str]]) -> str:
+        # ... (method remains unchanged)
+
+    async def generate_response(self, augmented_input: str) -> str:
+        # ... (method remains unchanged)
+
+    async def rag(self, query: str, chat_history: List[Dict[str, str]], columns: List[str] = None) -> str:
+        # ... (method remains unchanged)
+
+    async def process_message(self, websocket: WebSocket, message: str, session_id: uuid.UUID):
+        # ... (method remains unchanged)
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Dict[uuid.UUID, WebSocket] = {}
+
+    async def connect(self, websocket: WebSocket) -> uuid.UUID:
+        await websocket.accept()
+        session_id = uuid.uuid4()
+        self.active_connections[session_id] = websocket
+        return session_id
+
+    def disconnect(self, session_id: uuid.UUID):
+        self.active_connections.pop(session_id, None)
+
+    async def send_personal_message(self, message: str, session_id: uuid.UUID):
+        if session_id in self.active_connections:
+            await self.active_connections[session_id].send_text(message)
+
+# Global variables
+chatbot = None
+manager = ConnectionManager()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: Initialize the chatbot and its dependencies
+    global chatbot
+    
+    # Initialize Azure OpenAI client
+    client = AsyncAzureOpenAI(
+        azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT_URI"),
+        api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+        api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
+    )
+
+    # Create OpenAI embedding function
+    openai_ef = OpenAIEmbeddingFunction(
+        api_key=os.getenv("AZURE_OPENAI_EMB_API_KEY"),
+        api_base=os.getenv("AZURE_OPENAI_EMB_ENDPOINT_URI"),
+        api_type="azure",
+        api_version=os.getenv("AZURE_OPENAI_EMB_API_VERSION"),
+    )
+
+    # Initialize Chroma client
+    chroma_client = chromadb.PersistentClient(path="./chromadb_csv", settings=Settings(anonymized_telemetry=False))
+
+    # Initialize RAGChatbot with the created clients
+    chatbot = RAGChatbot(client, openai_ef, chroma_client)
+
+    yield
+
+    # Shutdown: Close the database connection
+    db.disconnect()
+
+# Initialize FastAPI app with lifespan
+app = FastAPI(lifespan=lifespan)
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    session_id = await manager.connect(websocket)
+    try:
+        while True:
+            message = await websocket.receive_text()
+            await chatbot.process_message(websocket, message, session_id)
+    except WebSocketDisconnect:
+        manager.disconnect(session_id)
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

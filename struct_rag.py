@@ -13,9 +13,8 @@ import asyncio
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 import uuid
-from datetime import datetime
-from pony.orm import Database, Required, Optional, Json, Set
-from pony.orm.asynchronous import set_sql_debug
+from datetime import datetime, timezone
+from pony.orm import Database, Required, Optional as PonyOptional, Json, Set, db_session, commit
 
 # Load environment variables
 load_dotenv('.env')
@@ -25,8 +24,8 @@ db = Database()
 
 class ChatSession(db.Entity):
     id = Required(uuid.UUID, default=uuid.uuid4, primary_key=True)
-    created_at = Required(datetime, default=datetime.utcnow)
-    updated_at = Required(datetime, default=datetime.utcnow)
+    created_at = Required(datetime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Required(datetime, default=lambda: datetime.now(timezone.utc))
     chat_history = Required(Json)
 
 # Connect to the database
@@ -209,9 +208,8 @@ class RAGChatbot:
 
     async def process_message(self, websocket: WebSocket, message: str, session_id: uuid.UUID):
         try:
-            @db.transaction(retry=3)
-            async def process_and_save():
-                chat_session = await ChatSession.get(id=session_id)
+            with db_session:
+                chat_session = ChatSession.get(id=session_id)
                 if not chat_session:
                     chat_session = ChatSession(id=session_id, chat_history=[])
                 
@@ -226,12 +224,9 @@ class RAGChatbot:
                     chat_history.pop(0)
                 
                 chat_session.chat_history = chat_history
-                chat_session.updated_at = datetime.utcnow()
+                chat_session.updated_at = datetime.now(timezone.utc)
                 
-                await chat_session.flush()
-                return response, chat_history
-
-            response, chat_history = await process_and_save()
+                commit()  # Commit the changes to the database
             
             # Send the response back to the client
             await websocket.send_json({"response": response, "chat_history": chat_history})
@@ -273,8 +268,13 @@ async def websocket_endpoint(websocket: WebSocket):
 
 @app.on_event("startup")
 async def startup():
-    # Pony ORM automatically creates tables if they don't exist
+    # Database connection is already set up in the global scope
     pass
+
+@app.on_event("shutdown")
+async def shutdown():
+    # Close the database connection
+    db.disconnect()
 
 if __name__ == "__main__":
     import uvicorn

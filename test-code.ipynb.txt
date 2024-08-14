@@ -1,0 +1,551 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Deploying SDXL on Amazon SageMaker\n",
+    "\n",
+    "This notebook walks through the process of deploying Stable Diffusion XL (SDXL) on Amazon SageMaker for both inference and training."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 1. Prepare Your Environment"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "!pip install \"sagemaker==2.116.0\" \"huggingface_hub==0.10.1\" python-dotenv --upgrade"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import os\n",
+    "from dotenv import load_dotenv\n",
+    "import boto3\n",
+    "import sagemaker\n",
+    "\n",
+    "load_dotenv()\n",
+    "\n",
+    "boto_session = boto3.setup_default_session(\n",
+    "    aws_access_key_id=os.environ.get('aws_access_key_id'),\n",
+    "    aws_secret_access_key=os.environ.get('aws_secret_access_key'),\n",
+    "    region_name=os.environ.get('region_name')\n",
+    ")\n",
+    "\n",
+    "sess = sagemaker.Session(boto_session=boto_session)\n",
+    "\n",
+    "print(f\"sagemaker bucket: {sess.default_bucket()}\")\n",
+    "print(f\"sagemaker session region: {sess.boto_region_name}\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 2. Prepare Your Model Files"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "!mkdir -p code"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "%%writefile code/requirements.txt\n",
+    "diffusers==0.19.3\n",
+    "transformers==4.31.0\n",
+    "torch==2.0.1\n",
+    "accelerate==0.21.0\n",
+    "compel==2.0.2\n",
+    "Pillow==10.0.0\n",
+    "fastapi==0.100.0\n",
+    "uvicorn==0.23.1\n",
+    "boto3==1.28.15"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "%%writefile code/inference.py\n",
+    "import os\n",
+    "import torch\n",
+    "from diffusers import DiffusionPipeline, DPMSolverMultistepScheduler\n",
+    "from compel import Compel, ReturnedEmbeddingsType\n",
+    "import json\n",
+    "import base64\n",
+    "from io import BytesIO\n",
+    "import asyncio\n",
+    "import subprocess\n",
+    "import boto3\n",
+    "\n",
+    "def model_fn(model_dir):\n",
+    "    base_path = os.path.join(model_dir, 'base')\n",
+    "    refiner_path = os.path.join(model_dir, 'refiner')\n",
+    "    lora_path = os.path.join(model_dir, 'Trained_lora')\n",
+    "\n",
+    "    base = DiffusionPipeline.from_pretrained(\n",
+    "        base_path,\n",
+    "        torch_dtype=torch.float16,\n",
+    "        variant=\"fp16\",\n",
+    "        use_safetensors=True,\n",
+    "    ).to(\"cuda\")\n",
+    "    \n",
+    "    base.load_lora_weights(\n",
+    "        lora_path,\n",
+    "        weight_name=\"pytorch_lora_weights.safetensors\"\n",
+    "    )\n",
+    "    \n",
+    "    refiner = DiffusionPipeline.from_pretrained(\n",
+    "        refiner_path,\n",
+    "        text_encoder_2=base.text_encoder_2,\n",
+    "        vae=base.vae,\n",
+    "        torch_dtype=torch.float16,\n",
+    "        use_safetensors=True,\n",
+    "        variant=\"fp16\",\n",
+    "    ).to(\"cuda\")\n",
+    "\n",
+    "    compel = Compel(\n",
+    "        tokenizer=[base.tokenizer, base.tokenizer_2],\n",
+    "        text_encoder=[base.text_encoder, base.text_encoder_2],\n",
+    "        returned_embeddings_type=ReturnedEmbeddingsType.PENULTIMATE_HIDDEN_STATES_NON_NORMALIZED,\n",
+    "        requires_pooled=[False, True])\n",
+    "\n",
+    "    compel_refiner = Compel(\n",
+    "        tokenizer=[refiner.tokenizer_2],\n",
+    "        text_encoder=[refiner.text_encoder_2],\n",
+    "        returned_embeddings_type=ReturnedEmbeddingsType.PENULTIMATE_HIDDEN_STATES_NON_NORMALIZED,\n",
+    "        requires_pooled=[True],\n",
+    "    )\n",
+    "\n",
+    "    return base, refiner, compel, compel_refiner\n",
+    "\n",
+    "def predict_fn(data, models):\n",
+    "    if data.get(\"action\") == \"train\":\n",
+    "        loop = asyncio.get_event_loop()\n",
+    "        return loop.run_until_complete(train_model(\n",
+    "            data[\"collection_s3_path\"],\n",
+    "            data[\"prompt\"],\n",
+    "            data[\"output_dir_name\"]\n",
+    "        ))\n",
+    "    else:\n",
+    "        base, refiner, compel, compel_refiner = models\n",
+    "        prompt = data.pop(\"prompt\", \"\")\n",
+    "        negative_prompt = data.pop(\"negative_prompt\", \"\")\n",
+    "\n",
+    "        conditioning, pooled = compel(prompt)\n",
+    "        negative_conditioning, negative_pooled = compel(negative_prompt)\n",
+    "        conditioning_refiner, pooled_refiner = compel_refiner(prompt)\n",
+    "        negative_conditioning_refiner, negative_pooled_refiner = compel_refiner(negative_prompt)\n",
+    "\n",
+    "        image = base(\n",
+    "            prompt_embeds=conditioning,\n",
+    "            pooled_prompt_embeds=pooled,\n",
+    "            negative_prompt_embeds=negative_conditioning,\n",
+    "            negative_pooled_prompt_embeds=negative_pooled,\n",
+    "            num_inference_steps=40,\n",
+    "            denoising_end=0.8,\n",
+    "            output_type=\"latent\",\n",
+    "        ).images[0]\n",
+    "\n",
+    "        refiner_result = refiner(\n",
+    "            prompt_embeds=conditioning_refiner,\n",
+    "            pooled_prompt_embeds=pooled_refiner,\n",
+    "            negative_prompt_embeds=negative_conditioning_refiner,\n",
+    "            negative_pooled_prompt_embeds=negative_pooled_refiner,\n",
+    "            num_inference_steps=40,\n",
+    "            denoising_start=0.8,\n",
+    "            image=image,\n",
+    "        ).images[0]\n",
+    "\n",
+    "        buffered = BytesIO()\n",
+    "        refiner_result.save(buffered, format=\"PNG\")\n",
+    "        img_str = base64.b64encode(buffered.getvalue()).decode()\n",
+    "\n",
+    "        return {'image': img_str}\n",
+    "\n",
+    "async def train_model(collection_s3_path, prompt, output_dir_name):\n",
+    "    s3 = boto3.resource('s3')\n",
+    "    collection_bucket, collection_key = parse_s3_uri(collection_s3_path)\n",
+    "    \n",
+    "    local_collection_path = '/tmp/training_data'\n",
+    "    download_from_s3(s3, collection_bucket, collection_key, local_collection_path)\n",
+    "    \n",
+    "    output_s3_path = f\"s3://{collection_bucket}/model_outputs/{output_dir_name}\"\n",
+    "    \n",
+    "    command = f\"\"\"\n",
+    "    accelerate launch train_dreambooth_lora_sdxl.py \\\n",
+    "      --pretrained_model_name_or_path='/opt/ml/model/base'  \\\n",
+    "      --instance_data_dir='{local_collection_path}' \\\n",
+    "      --pretrained_vae_model_name_or_path=\"madebyollin/sdxl-vae-fp16-fix\" \\\n",
+    "      --output_dir=\"/tmp/trained_model\" \\\n",
+    "      --mixed_precision=\"fp16\" \\\n",
+    "      --instance_prompt=\"{prompt}\" \\\n",
+    "      --resolution=1024 \\\n",
+    "      --train_batch_size=2 \\\n",
+    "      --gradient_accumulation_steps=2 \\\n",
+    "      --gradient_checkpointing \\\n",
+    "      --learning_rate=1e-4 \\\n",
+    "      --lr_scheduler=\"constant\" \\\n",
+    "      --lr_warmup_steps=0 \\\n",
+    "      --max_train_steps=500 \\\n",
+    "      --seed=\"0\"\n",
+    "    \"\"\"\n",
+    "    \n",
+    "    process = await asyncio.create_subprocess_shell(\n",
+    "        command,\n",
+    "        stdout=asyncio.subprocess.PIPE,\n",
+    "        stderr=asyncio.subprocess.PIPE\n",
+    "    )\n",
+    "    stdout, stderr = await process.communicate()\n",
+    "    \n",
+    "    if process.returncode == 0:\n",
+    "        upload_to_s3(s3, '/tmp/trained_model', collection_bucket, f\"model_outputs/{output_dir_name}\")\n",
+    "        return {\"status\": \"success\", \"output_s3_path\": output_s3_path}\n",
+    "    else:\n",
+    "        return {\"status\": \"failed\", \"error\": stderr.decode()}\n",
+    "\n",
+    "def parse_s3_uri(uri):\n",
+    "    parts = uri.replace(\"s3://\", \"\").split(\"/\")\n",
+    "    bucket = parts.pop(0)\n",
+    "    key = \"/\".join(parts)\n",
+    "    return bucket, key\n",
+    "\n",
+    "def download_from_s3(s3, bucket, key, local_path):\n",
+    "    os.makedirs(local_path, exist_ok=True)\n",
+    "    for obj in s3.Bucket(bucket).objects.filter(Prefix=key):\n",
+    "        if not obj.key.endswith('/'):\n",
+    "            target = os.path.join(local_path, os.path.relpath(obj.key, key))\n",
+    "            if not os.path.exists(os.path.dirname(target)):\n",
+    "                os.makedirs(os.path.dirname(target))\n",
+    "            s3.Bucket(bucket).download_file(obj.key, target)\n",
+    "\n",
+    "def upload_to_s3(s3, local_dir, bucket, s3_path):\n",
+    "    for root, _, files in os.walk(local_dir):\n",
+    "        for file in files:\n",
+    "            local_file = os.path.join(root, file)\n",
+    "            relative_path = os.path.relpath(local_file, local_dir)\n",
+    "            s3_file = os.path.join(s3_path, relative_path)\n",
+    "            s3.Bucket(bucket).upload_file(local_file, s3_file)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 3. Download and Prepare the Model"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "from distutils.dir_util import copy_tree\n",
+    "from pathlib import Path\n",
+    "from huggingface_hub import snapshot_download\n",
+    "import random\n",
+    "import os\n",
+    "\n",
+    "# Set up model IDs and tokens\n",
+    "BASE_MODEL_ID = \"stabilityai/stable-diffusion-xl-base-1.0\"\n",
+    "REFINER_MODEL_ID = \"stabilityai/stable-diffusion-xl-refiner-1.0\"\n",
+    "HF_TOKEN = os.environ.get('HF_TOKEN')\n",
+    "assert len(HF_TOKEN) > 0, \"Please set HF_TOKEN to your huggingface token.\"\n",
+    "\n",
+    "# Create a unique directory for the model\n",
+    "model_tar = Path(f\"model-{random.getrandbits(16)}\")\n",
+    "model_tar.mkdir(exist_ok=True)\n",
+    "\n",
+    "# Download and copy base model\n",
+    "print(\"Downloading base model...\")\n",
+    "base_snapshot_dir = snapshot_download(repo_id=BASE_MODEL_ID, revision=\"main\", use_auth_token=HF_TOKEN)\n",
+    "base_model_dir = model_tar / \"base\"\n",
+    "base_model_dir.mkdir(exist_ok=True)\n",
+    "copy_tree(base_snapshot_dir, str(base_model_dir))\n",
+    "\n",
+    "# Download and copy refiner model\n",
+    "print(\"Downloading refiner model...\")\n",
+    "print("Downloading refiner model...")"
+    "refiner_snapshot_dir = snapshot_download(repo_id=REFINER_MODEL_ID, revision="main", use_auth_token=HF_TOKEN)"
+    "refiner_model_dir = model_tar / "refiner""
+    "refiner_model_dir.mkdir(exist_ok=True)"
+    "copy_tree(refiner_snapshot_dir, str(refiner_model_dir))"
+    "# Create a directory for LoRA weights (assuming you have them)"
+    "lora_dir = model_tar / "Trained_lora""
+    "lora_dir.mkdir(exist_ok=True)"
+    "# If you have LoRA weights, uncomment and modify the following line:"
+    "# copy_tree("path/to/your/lora/weights", str(lora_dir))"
+    "# Copy the code directory"
+    "code_dir = model_tar / "code""
+    "code_dir.mkdir(exist_ok=True)"
+    "copy_tree("code/", str(code_dir))"
+    "print(f"Model files prepared in directory: {model_tar}")"
+    "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 4. Create and Upload Model Archive"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import tarfile\n",
+    "import os\n",
+    "\n",
+    "def compress(tar_dir=None,output_file=\"model.tar.gz\"):\n",
+    "    parent_dir=os.getcwd()\n",
+    "    os.chdir(tar_dir)\n",
+    "    with tarfile.open(os.path.join(parent_dir, output_file), \"w:gz\") as tar:\n",
+    "        for item in os.listdir('.'):\n",
+    "          print(item)\n",
+    "          tar.add(item, arcname=item)\n",
+    "    os.chdir(parent_dir)\n",
+    "\n",
+    "compress(str(model_tar))\n",
+    "\n",
+    "from sagemaker.s3 import S3Uploader\n",
+    "\n",
+    "s3_model_uri=S3Uploader.upload(local_path=\"model.tar.gz\", desired_s3_uri=f\"s3://{sess.default_bucket()}/sdxl-model\")\n",
+    "\n",
+    "print(f\"model uploaded to: {s3_model_uri}\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 5. Deploy the Model"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "from sagemaker.huggingface.model import HuggingFaceModel\n",
+    "\n",
+    "role = \"arn:aws:iam::YOUR_ACCOUNT_ID:role/YOUR_SAGEMAKER_EXECUTION_ROLE\"\n",
+    "\n",
+    "huggingface_model = HuggingFaceModel(\n",
+    "   model_data=s3_model_uri,\n",
+    "   role=role,\n",
+    "   transformers_version=\"4.28.1\",\n",
+    "   pytorch_version=\"2.0.0\",\n",
+    "   py_version='py310',\n",
+    ")\n",
+    "\n",
+    "predictor = huggingface_model.deploy(\n",
+    "    initial_instance_count=1,\n",
+    "    instance_type=\"ml.g5.2xlarge\"  # or an appropriate GPU instance\n",
+    ")\n",
+    "\n",
+    "print(f\"Endpoint name: {predictor.endpoint_name}\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 6. Use the Endpoint for Inference"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import boto3\n",
+    "from PIL import Image\n",
+    "from io import BytesIO\n",
+    "import base64\n",
+    "import json\n",
+    "import time\n",
+    "\n",
+    "def decode_base64_image(image_string):\n",
+    "  base64_image = base64.b64decode(image_string)\n",
+    "  buffer = BytesIO(base64_image)\n",
+    "  return Image.open(buffer)\n",
+    "\n",
+    "client = boto3.client('sagemaker-runtime')\n",
+    "\n",
+    "prompt = \"A majestic lion, digital art\"\n",
+    "negative_prompt = \"blurry, bad art, poor quality\"\n",
+    "\n",
+    "payload = {\n",
+    "    \"prompt\": prompt,\n",
+    "    \"negative_prompt\": negative_prompt\n",
+    "}\n",
+    "\n",
+    "serialized_payload = json.dumps(payload)\n",
+    "\n",
+    "endpoint_name = predictor.endpoint_name\n",
+    "\n",
+    "start_time = time.time()\n",
+    "\n",
+    "response = client.invoke_endpoint(\n",
+    "    EndpointName=endpoint_name,\n",
+    "    Body=serialized_payload,\n",
+    "    ContentType='application/json'\n",
+    ")\n",
+    "\n",
+    "response_payload = json.loads(response['Body'].read().decode(\"utf-8\"))\n",
+    "\n",
+    "end_time = time.time()\n",
+    "\n",
+    "elapsed_time = end_time - start_time\n",
+    "print(f\"Elapsed time: {elapsed_time} seconds\")\n",
+    "\n",
+    "decoded_image = decode_base64_image(response_payload[\"image\"])\n",
+    "decoded_image.show()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 7. Use the Endpoint for Training"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import boto3\n",
+    "import json\n",
+    "\n",
+    "runtime = boto3.client('sagemaker-runtime')\n",
+    "\n",
+    "endpoint_name = predictor.endpoint_name\n",
+    "content_type = \"application/json\"\n",
+    "\n",
+    "payload = {\n",
+    "    \"action\": \"train\",\n",
+    "    \"collection_s3_path\": \"s3://your-bucket/path/to/training/images\",\n",
+    "    \"prompt\": \"a photo of sks dog\",\n",
+    "    \"output_dir_name\": \"sks_dog_model\"\n",
+    "}\n",
+    "\n",
+    "response = runtime.invoke_endpoint(\n",
+    "    EndpointName=endpoint_name, \n",
+    "    ContentType=content_type,\n",
+    "    Body=json.dumps(payload)\n",
+    ")\n",
+    "\n",
+    "result = json.loads(response['Body'].read().decode())\n",
+    "print(result)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 8. Check Training Status"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import boto3\n",
+    "import json\n",
+    "\n",
+    "runtime = boto3.client('sagemaker-runtime')\n",
+    "\n",
+    "endpoint_name = predictor.endpoint_name\n",
+    "content_type = \"application/json\"\n",
+    "\n",
+    "payload = {\n",
+    "    \"action\": \"train-status\"\n",
+    "}\n",
+    "\n",
+    "response = runtime.invoke_endpoint(\n",
+    "    EndpointName=endpoint_name, \n",
+    "    ContentType=content_type,\n",
+    "    Body=json.dumps(payload)\n",
+    ")\n",
+    "\n",
+    "result = json.loads(response['Body'].read().decode())\n",
+    "print(result)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 9. Clean Up"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import boto3\n",
+    "\n",
+    "sagemaker = boto3.client('sagemaker')\n",
+    "\n",
+    "sagemaker.delete_endpoint(EndpointName=predictor.endpoint_name)\n",
+    "sagemaker.delete_endpoint_config(EndpointConfigName=predictor.endpoint_name)\n",
+    "sagemaker.delete_model(ModelName=predictor.endpoint_name)\n",
+    "\n",
+    "print(\"Cleanup completed.\")"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.8.0"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 4
+}
